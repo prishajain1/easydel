@@ -16,6 +16,7 @@
 import functools
 
 import chex
+import jax
 import jax.lax
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
@@ -54,7 +55,7 @@ def position_ids_in_meshgrid(patch_embeds_list, max_width):
     return jnp.concatenate(positions)
 
 
-# TODO:Make this jitable
+@jax.jit
 def generate_block_attention_mask(patch_embeds_list, tensor):
     """Generates a block-diagonal attention mask for multi-image processing.
 
@@ -62,7 +63,8 @@ def generate_block_attention_mask(patch_embeds_list, tensor):
     preventing cross-image attention.
 
     Args:
-        patch_embeds_list (list[int]): A list containing the number of patches for each image.
+        patch_embeds_list (chex.Array | list[int]): Array or list containing the number of
+            patches for each image.
         tensor (chex.Array): The input tensor (e.g., hidden states) with shape
             (batch_size, sequence_length, ...).
 
@@ -72,13 +74,16 @@ def generate_block_attention_mask(patch_embeds_list, tensor):
             The mask contains 0.0 for allowed attention positions and a large negative number
             (minimum float value) for masked positions.
     """
+    # Convert to JAX array if needed for JIT compatibility
+    patch_embeds_array = jnp.asarray(patch_embeds_list)
+
     dtype = tensor.dtype
     seq_len = tensor.shape[1]
     d_min = jnp.finfo(dtype).min
     causal_mask = jnp.full((seq_len, seq_len), fill_value=d_min, dtype=dtype)
 
-    block_end_idx = jnp.cumsum(jnp.array(patch_embeds_list))
-    block_start_idx = jnp.cumsum(jnp.array([0, *patch_embeds_list[:-1]]))
+    block_end_idx = jnp.cumsum(patch_embeds_array)
+    block_start_idx = jnp.concatenate([jnp.array([0]), jnp.cumsum(patch_embeds_array)[:-1]])
 
     def update_mask(mask, start_end):
         start, end = start_end
@@ -86,7 +91,7 @@ def generate_block_attention_mask(patch_embeds_list, tensor):
 
     causal_mask = jax.lax.fori_loop(
         0,
-        len(block_start_idx),
+        len(patch_embeds_array),
         lambda i, mask: update_mask(mask, (block_start_idx[i], block_end_idx[i])),
         causal_mask,
     )
