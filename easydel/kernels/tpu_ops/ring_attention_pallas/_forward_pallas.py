@@ -36,6 +36,93 @@ from ._utils import (
 )
 
 
+def _ulysses_flash_attention_fwd_tpu(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    axis_name: str = "cp",
+    *,
+    query_chunk_size: int = 1024,
+    key_chunk_size: int = 512,
+    causal_block_size: int | None = 1,
+) -> jax.Array:
+    """Layout-preserving Ulysses context-parallel causal FlashAttention on TPU.
+
+    Packs (q, k, v) into a single all-to-all collective along the feature dimension,
+    avoids (S, H_local, D) <-> (H_local, S, D) transpose barriers around all_to_all,
+    and uses larger block_k tiles with off-diagonal causal mask skipping.
+    Supports both [S_local, H, D] and [B, S_local, H, D] inputs.
+    """
+    unbatched = q.ndim == 3
+    if unbatched:
+        q, k, v = q[None, ...], k[None, ...], v[None, ...]
+
+    batch, s_local, num_heads, d_orig = q.shape
+    scale = float(d_orig**-0.5)
+
+    # Pack Q, K, V along feature axis to issue a single fused all-to-all collective
+    qkv = jnp.concatenate([q, k, v], axis=-1)
+    qkv = lax.all_to_all(qkv, axis_name, split_axis=2, concat_axis=1, tiled=True)
+    s_full = qkv.shape[1]
+    h_local = qkv.shape[2]
+
+    # Reshape/view into [B, H_local, S_full, 3 * D] without full HBM transpose when H_local == 1
+    if h_local == 1:
+        qkv_bh = qkv.reshape(batch, 1, s_full, 3 * d_orig)
+    else:
+        qkv_bh = jnp.swapaxes(qkv, 1, 2)
+
+    qh = qkv_bh[..., :d_orig]
+    kh = qkv_bh[..., d_orig : 2 * d_orig]
+    vh = qkv_bh[..., 2 * d_orig :]
+
+    pad_d = (-d_orig) % MIN_BLOCK_SIZE
+    if pad_d:
+        qh = jnp.pad(qh, ((0, 0), (0, 0), (0, 0), (0, pad_d)))
+        kh = jnp.pad(kh, ((0, 0), (0, 0), (0, 0), (0, pad_d)))
+        vh = jnp.pad(vh, ((0, 0), (0, 0), (0, 0), (0, pad_d)))
+    head_dim = d_orig + pad_d
+
+    block_q = min(query_chunk_size, s_full)
+    block_k = min(key_chunk_size, s_full // 2) if s_full >= 256 else s_full
+
+    acc = jnp.zeros((batch, h_local, s_full, head_dim), dtype=jnp.float32)
+    l_prev = jnp.zeros((batch, h_local, s_full), dtype=jnp.float32)
+    m_prev = jnp.full((batch, h_local, s_full), DEFAULT_MASK_VALUE, dtype=jnp.float32)
+    q_chunk_idx_start = jnp.array(0, dtype=jnp.int32)
+    k_chunk_idx_start = jnp.array(0, dtype=jnp.int32)
+
+    out_bh = _flash_attention_impl(
+        qh,
+        kh,
+        vh,
+        carry=(acc, l_prev, m_prev),
+        q_chunk_idx_start=q_chunk_idx_start,
+        k_chunk_idx_start=k_chunk_idx_start,
+        ab=None,
+        segment_ids=None,
+        save_residuals=False,
+        causal_block_size=causal_block_size,
+        sm_scale=scale,
+        block_b=1,
+        block_q=block_q,
+        block_k_major=block_k,
+        block_k=block_k,
+        debug=False,
+    )
+    if pad_d:
+        out_bh = out_bh[..., :d_orig]
+    out_bh = out_bh.astype(q.dtype)
+
+    if h_local == 1:
+        out = out_bh.reshape(batch, s_full, 1, d_orig)
+    else:
+        out = jnp.swapaxes(out_bh, 1, 2)
+
+    out = lax.all_to_all(out, axis_name, split_axis=1, concat_axis=2, tiled=True)
+    return out[0] if unbatched else out
+
+
 def _ring_flash_attention_fwd_tpu(
     q,
     k,
@@ -378,17 +465,28 @@ def _flash_attention_kernel_single_batch(
                 mask = jnp.equal(q_segment_ids, kv_segment_ids).astype(jnp.bool_)
 
             if causal_block_size is not None:
+                q_start_token = (q_seq_idx + q_chunk_idx_start) * block_q
+                k_start_token = (kv_seq_idx + k_chunk_idx_start) * block_k_major + start_k
+                # Skip VPU iota/div/where on strictly lower-triangular (fully unmasked) KV blocks
+                is_diagonal_or_straddling = k_start_token + block_k > q_start_token
                 mask_shape = (block_q, block_k)
-                row_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 0)
-                row_ids += (q_seq_idx + q_chunk_idx_start) * block_q
-                row_ids = jax.lax.div(row_ids, causal_block_size)
-                col_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 1)
-                col_ids += (kv_seq_idx + k_chunk_idx_start) * block_k_major + start_k
-                col_ids = jax.lax.div(col_ids, causal_block_size)
+                row_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 0) + q_start_token
+                col_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 1) + k_start_token
+                if causal_block_size != 1:
+                    row_ids = jax.lax.div(row_ids, causal_block_size)
+                    col_ids = jax.lax.div(col_ids, causal_block_size)
                 causal_mask = col_ids <= row_ids
-                mask = causal_mask if mask is None else jnp.logical_and(mask, causal_mask)
-
-            s = s if mask is None else s + jnp.where(mask, 0.0, mask_value)
+                if mask is None:
+                    s = jnp.where(
+                        is_diagonal_or_straddling,
+                        jnp.where(causal_mask, s, mask_value),
+                        s,
+                    )
+                else:
+                    mask = jnp.logical_and(mask, causal_mask)
+                    s = s + jnp.where(mask, 0.0, mask_value)
+            elif mask is not None:
+                s = s + jnp.where(mask, 0.0, mask_value)
 
             m_curr = jnp.max(s, axis=1)[:, None]  # Row max, shape [block_q, 1].
             m_next = jnp.maximum(m_prev, m_curr)  # Shape [block_q, 128].
@@ -414,19 +512,35 @@ def _flash_attention_kernel_single_batch(
             l_scratch_ref[batch_idx] = l_next
             m_scratch_ref[batch_idx] = m_next
 
-            l_next_inv_safe = jnp.where(l_next == 0.0, 1.0, 1.0 / l_next)
-            acc_scratch_ref[batch_idx] *= l_broadcast(l_corr * l_next_inv_safe)
-            v = pl.load(v_tile_ref, (*batch_idx, pl.dslice(start_k, block_k), slice(None)))
-            o_curr = jax.lax.dot(p.astype(v.dtype), v, preferred_element_type=jnp.float32)
-            acc_scratch_ref[batch_idx] += o_curr * l_broadcast(l_next_inv_safe)
+            if l_ref is None and m_ref is None:
+                # Single-pass FlashAttention: defer division by l_next until final writeout
+                acc_scratch_ref[batch_idx] = acc_scratch_ref[batch_idx] * l_broadcast(alpha)
+                v = pl.load(v_tile_ref, (*batch_idx, pl.dslice(start_k, block_k), slice(None)))
+                o_curr = jax.lax.dot(p.astype(v.dtype), v, preferred_element_type=jnp.float32)
+                acc_scratch_ref[batch_idx] += o_curr
+            else:
+                l_next_inv_safe = jnp.where(l_next == 0.0, 1.0, 1.0 / l_next)
+                acc_scratch_ref[batch_idx] *= l_broadcast(l_corr * l_next_inv_safe)
+                v = pl.load(v_tile_ref, (*batch_idx, pl.dslice(start_k, block_k), slice(None)))
+                o_curr = jax.lax.dot(p.astype(v.dtype), v, preferred_element_type=jnp.float32)
+                acc_scratch_ref[batch_idx] += o_curr * l_broadcast(l_next_inv_safe)
 
     @pl.when(kv_seq_idx == (kv_seq_len // block_k_major) - 1)
     def store_output():
-        o_tile_ref[batch_idx] = acc_scratch_ref[batch_idx].astype(o_tile_ref.dtype)
-        if l_ref is not None:
-            l_ref[batch_idx] = l_scratch_ref[batch_idx].astype(l_ref.dtype)
-        if m_ref is not None:
-            m_ref[batch_idx] = m_scratch_ref[batch_idx].astype(m_ref.dtype)
+        if l_ref is None and m_ref is None:
+            head_dim_repeats, rem = divmod(head_dim, MIN_BLOCK_SIZE)
+            if rem and head_dim_repeats == 0:
+                l_final = l_scratch_ref[batch_idx][:, :head_dim]
+            else:
+                l_final = pltpu.repeat(l_scratch_ref[batch_idx], head_dim_repeats, 1)
+            l_inv = jnp.where(l_final == 0.0, 1.0, 1.0 / l_final)
+            o_tile_ref[batch_idx] = (acc_scratch_ref[batch_idx] * l_inv).astype(o_tile_ref.dtype)
+        else:
+            o_tile_ref[batch_idx] = acc_scratch_ref[batch_idx].astype(o_tile_ref.dtype)
+            if l_ref is not None:
+                l_ref[batch_idx] = l_scratch_ref[batch_idx].astype(l_ref.dtype)
+            if m_ref is not None:
+                m_ref[batch_idx] = m_scratch_ref[batch_idx].astype(m_ref.dtype)
 
 
 def _flash_attention_impl(
